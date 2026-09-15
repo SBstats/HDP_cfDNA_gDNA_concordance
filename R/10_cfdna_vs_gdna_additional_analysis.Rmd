@@ -1,0 +1,880 @@
+---
+title: "cfDNA vs gDNA 5-hmC at Screening as Predictors of MRD by NGS at Cycle 8"
+subtitle: "Predictive-modeling complement to the Bayesian DP-mixture comparison"
+author: "Saurabh Bhandari, Yuan Ji, Brian C.-H. Chiu, and others"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{float}
+  - \usepackage{array}
+  - \usepackage[utf8]{inputenc}
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo      = FALSE,
+  message   = FALSE,
+  warning   = FALSE,
+  fig.pos   = "H",
+  fig.align = "center",
+  out.width = "85%"
+)
+
+set.seed(20260609)
+
+suppressPackageStartupMessages({
+  # Load Bioconductor packages FIRST, so their exports (rename, select, ...)
+  # are masked by the dplyr/tidyr versions loaded later. Otherwise, dplyr::
+  # qualifiers are needed everywhere.
+  library(DESeq2)
+  library(SummarizedExperiment)
+  library(dplyr)
+  library(tidyr)
+  library(readxl)
+  library(mclust)
+  library(glmnet)
+  library(pROC)
+  library(ggplot2)
+  library(knitr)
+  library(kableExtra)
+})
+
+base_dir  <- normalizePath(file.path(dirname(knitr::current_input(dir = TRUE)), ".."),
+                           mustWork = FALSE)
+data_dir  <- file.path(base_dir, "KRd trial", "5hmC data")
+clin_path <- file.path(base_dir, "KRd trial", "Clinical data",
+                       "KRd 12_1725 data_2_14_2023 from Ben without PHI.xlsx")
+
+fig_out <- file.path(base_dir, "nature_manuscript", "figures")
+dir.create(fig_out, showWarnings = FALSE, recursive = TRUE)
+
+# Helper: save every figure to nature_manuscript/figures/ as both PDF and PNG.
+# Use base R devices via `device = grDevices::pdf` / `grDevices::png` rather
+# than ragg, which can hit "Graphics API version mismatch" inside knitr.
+save_both <- function(plot, basename, width = 7, height = 5, dpi = 300) {
+  pdf_path <- file.path(fig_out, paste0(basename, ".pdf"))
+  png_path <- file.path(fig_out, paste0(basename, ".png"))
+  ggsave(pdf_path, plot, width = width, height = height, device = grDevices::pdf)
+  ggsave(png_path, plot, width = width, height = height,
+         device = grDevices::png, dpi = dpi, units = "in")
+  invisible(list(pdf = pdf_path, png = png_path))
+}
+```
+
+# Section 1. cfDNA vs gDNA at Screening as predictors of MRD by NGS at Cycle 8
+
+## Introduction
+
+The Bayesian Dirichlet-process-mixture comparison in the main text reaches a
+verdict: under the source-DP $\mathcal{M}_0$ null, the
+data favour hierarchical coupling of cfDNA and gDNA mixture weights ($\Delta$WAIC
+$\approx +3.3 \times 10^{6}$). This document provides a *complementary,
+predictive* check at the patient level: **can cfDNA 5-hmC measured at Screening
+predict MRD-by-NGS status at Cycle 8 about as well as gDNA 5-hmC measured at
+Screening?** If a cfDNA-only model performs comparably to a gDNA-only model on
+this prediction task, that is direct clinical-utility support for cfDNA as a
+non-invasive early-monitoring biomarker.
+
+We fit three penalised logistic models on the 17 patients with paired
+Screening cfDNA + gDNA 5-hmC profiles AND a recorded MRD-NGS C8 outcome:
+
+  (i)   **cfDNA-only**: predictors = age + screened cfDNA 5-hmC genes;
+  (ii)  **gDNA-only**: predictors = age + screened gDNA 5-hmC genes;
+  (iii) **cfDNA + gDNA combined**: predictors = age + screened cfDNA genes +
+        screened gDNA genes.
+
+Age is included unpenalised.
+We use leave-one-out cross-validation (LOO-CV) with the two-stage gene screen
+(univariate logistic Wald-p filter + GMM on $|\hat\beta|$) executed **inside**
+each LOO fold so that no held-out information leaks into screening.
+
+This analysis is framed as **exploratory and hypothesis-generating**, not as
+confirmatory predictive validation: with $n=17$ and a 7-vs-10 class split,
+DeLong 95% confidence intervals on AUROCs are inherently wide (~0.30), and a
+non-significant cfDNA-vs-gDNA difference is consistent with both genuine
+equivalence and an underpowered comparison.
+
+\newpage
+
+## Data ingestion and cohort construction
+
+```{r load-data}
+cf_counts <- readRDS(file.path(data_dir, "kRd-cfDNA_genebody_count.RDS"))
+g_counts  <- readRDS(file.path(data_dir, "kRd-gDNA_genebody_count.RDS"))
+cf_key    <- read.csv(file.path(data_dir, "kRd-cfDNA_sample_key.csv"),
+                      stringsAsFactors = FALSE)
+g_key     <- read.csv(file.path(data_dir, "kRd-gDNA_sample_key.csv"),
+                      stringsAsFactors = FALSE)
+clin      <- suppressWarnings(
+  read_excel(clin_path, sheet = "12_1725 cfDNA Dataset")
+)
+```
+
+```{r build-cohort}
+# Restrict each key to Screening
+cf_scr <- dplyr::filter(cf_key, Timepoint == "Screening")
+g_scr  <- dplyr::filter(g_key,  Timepoint == "Screening")
+
+# Paired patients = Study.ID present in BOTH Screening keys
+paired_ids <- intersect(cf_scr$Study.ID, g_scr$Study.ID)
+
+# Clinical: MRD-C8 + Age, keyed on Study.ID
+clin_min <- clin %>%
+  dplyr::transmute(
+    Study.ID  = `Study number`,
+    mrd_neg   = `MRD post 8 cycles by NGS (Adaptive) negative =1`,
+    age       = Age
+  ) %>%
+  dplyr::filter(!is.na(mrd_neg))
+
+# Cohort = paired patients with MRD-C8 + Age
+cohort <- data.frame(Study.ID = paired_ids, stringsAsFactors = FALSE) %>%
+  dplyr::inner_join(clin_min, by = "Study.ID") %>%
+  dplyr::arrange(Study.ID)
+
+stopifnot(nrow(cohort) == 17)
+
+# Outcome coding: y = 1 if MRD-POSITIVE (residual disease, "worse" outcome).
+# clin's "MRD ... negative = 1" so y = 1 - mrd_neg.
+cohort$y01 <- 1L - as.integer(cohort$mrd_neg)
+cohort$y   <- factor(cohort$y01, levels = c(0L, 1L),
+                     labels = c("MRDneg", "MRDpos"))
+
+# Per-patient Screening sample barcodes for the two count matrices.
+# Note: explicit dplyr:: qualifiers because S4Vectors (loaded by DESeq2)
+# also exports `rename` and `select`, which mask the dplyr versions.
+cf_lookup <- dplyr::select(cf_scr, Study.ID, Assigned.ID)
+g_lookup  <- dplyr::select(g_scr,  Study.ID, Assigned.ID)
+
+cohort <- cohort %>%
+  dplyr::left_join(dplyr::rename(cf_lookup, cf_barcode = Assigned.ID),
+                   by = "Study.ID") %>%
+  dplyr::left_join(dplyr::rename(g_lookup,  g_barcode  = Assigned.ID),
+                   by = "Study.ID")
+
+# Subset the count matrices to the 17 paired Screening samples,
+# in the canonical patient order defined by `cohort`.
+cf_counts_cohort <- cf_counts[, cohort$cf_barcode, drop = FALSE]
+g_counts_cohort  <- g_counts[,  cohort$g_barcode,  drop = FALSE]
+stopifnot(ncol(cf_counts_cohort) == 17, ncol(g_counts_cohort) == 17)
+colnames(cf_counts_cohort) <- cohort$Study.ID
+colnames(g_counts_cohort)  <- cohort$Study.ID
+```
+
+```{r table1-cohort}
+tab1_summary <- data.frame(
+  Characteristic = c(
+    "n (paired Screening cfDNA + gDNA with MRD-C8)",
+    "Age (years), mean (SD)",
+    "Age (years), range",
+    "MRD-positive at C8 (n, %)",
+    "MRD-negative at C8 (n, %)"
+  ),
+  Value = c(
+    sprintf("%d", nrow(cohort)),
+    sprintf("%.1f (%.1f)", mean(cohort$age), sd(cohort$age)),
+    sprintf("%d - %d", min(cohort$age), max(cohort$age)),
+    sprintf("%d (%.1f%%)",
+            sum(cohort$y01 == 1),
+            100 * mean(cohort$y01 == 1)),
+    sprintf("%d (%.1f%%)",
+            sum(cohort$y01 == 0),
+            100 * mean(cohort$y01 == 0))
+  ),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(
+  tab1_summary, format = "latex", booktabs = TRUE, escape = TRUE,
+  caption = "Cohort characteristics. Outcome is MRD-NGS positivity at Cycle 8."
+) %>% kable_styling(latex_options = c("HOLD_position"))
+```
+
+\newpage
+
+## Per-source filtering and variance-stabilising transformation
+
+VST is applied **separately** to cfDNA and gDNA so that the
+predictive performance of each source reflects only its own variance structure.
+Filtering criterion (mirrors `R/02_preprocess.R`): remove genes with fewer
+than 10 counts in more than 5% of cohort samples within each source.
+
+```{r filter-and-vst}
+filter_counts <- function(M, min_count = 10, frac_max_low = 0.05) {
+  n_samp <- ncol(M)
+  thr <- ceiling(n_samp * frac_max_low)
+  low_per_gene <- rowSums(M < min_count)
+  keep <- low_per_gene <= thr
+  M[keep, , drop = FALSE]
+}
+
+cf_counts_f <- filter_counts(cf_counts_cohort)
+g_counts_f  <- filter_counts(g_counts_cohort)
+
+vst_per_source <- function(M, label) {
+  meta <- data.frame(sample = colnames(M),
+                     row.names = colnames(M),
+                     stringsAsFactors = FALSE)
+  dds <- DESeqDataSetFromMatrix(
+    countData = round(M),
+    colData   = meta,
+    design    = ~ 1
+  )
+  vsd <- vst(dds, blind = TRUE)
+  t(SummarizedExperiment::assay(vsd))   # samples x genes
+}
+
+X_cf <- vst_per_source(cf_counts_f, "cfDNA")
+X_g  <- vst_per_source(g_counts_f,  "gDNA")
+
+stopifnot(nrow(X_cf) == 17, nrow(X_g) == 17)
+```
+
+```{r vst-summary}
+vst_summary <- data.frame(
+  Source = c("cfDNA", "gDNA"),
+  `Raw genes`            = c(nrow(cf_counts_cohort), nrow(g_counts_cohort)),
+  `After count filter`   = c(ncol(X_cf), ncol(X_g)),
+  `% retained`           = c(
+    sprintf("%.1f%%", 100 * ncol(X_cf) / nrow(cf_counts_cohort)),
+    sprintf("%.1f%%", 100 * ncol(X_g)  / nrow(g_counts_cohort))
+  ),
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+knitr::kable(
+  vst_summary, format = "latex", booktabs = TRUE, escape = TRUE,
+  caption = "Gene counts before and after per-source filtering (10-count threshold in >5% of 17 samples). DESeq2 VST applied per source with design = ~1, blind = TRUE."
+) %>% kable_styling(latex_options = c("HOLD_position"))
+```
+
+\newpage
+
+## Two-stage gene screening (executed inside each LOO fold)
+
+Stage 1 fits a univariate logistic regression of MRD-C8 status on each gene
+$j$: $\mathrm{logit}\,\Pr(y = 1) = \alpha_j + \beta_j x_{ij}$. Genes with Wald
+$p$-value $<\alpha$ (default 0.05) survive, capped at the 200 most significant.
+
+Stage 2 fits a 3-component Gaussian mixture (via `mclust::Mclust`) to the
+absolute coefficients $|\hat\beta_j|$ of the Stage-1 survivors and keeps the
+cluster with the largest mean $|\hat\beta|$ ("most predictive"). Defensive
+fallbacks: with $\leq 3$ survivors, skip GMM and keep all; if `mclust` errors,
+fall back to k-means with `centers = 3`.
+
+The training-set means and SDs returned by the screen are used to standardize
+both the training rows and the held-out row, preventing test-set leakage into
+standardization.
+
+```{r screen-fn}
+# .logit_screen_one: univariate logit Wald p-value + slope for one gene.
+# Returns c(beta, p). NA on non-convergence.
+.logit_screen_one <- function(x, y01) {
+  fit <- tryCatch(
+    suppressWarnings(glm.fit(cbind(1, x), y01,
+                             family = binomial())),
+    error = function(e) NULL)
+  if (is.null(fit) || !fit$converged) return(c(NA_real_, NA_real_))
+  beta <- fit$coefficients[2]
+  V <- tryCatch(summary.glm(structure(fit, class = c("glm","lm")))$cov.scaled,
+                error = function(e) NULL)
+  if (is.null(V) || nrow(V) < 2 || is.na(V[2,2]) || V[2,2] <= 0)
+    return(c(beta, NA_real_))
+  se <- sqrt(V[2,2]); z <- beta / se
+  c(beta, 2 * stats::pnorm(-abs(z)))
+}
+
+# screen_genes(): returns the kept-gene names plus train-set scale info.
+screen_genes <- function(Xtr, y01tr,
+                         alpha = 0.05, cap = 200, G = 3, min_for_gmm = 4L) {
+  stopifnot(nrow(Xtr) == length(y01tr))
+  res <- apply(Xtr, 2, .logit_screen_one, y01 = y01tr)
+  beta_all <- res[1, ]
+  p_all    <- res[2, ]
+  ord <- order(p_all, na.last = NA)
+  if (length(ord) == 0L) {
+    # nothing converged; keep most-variable gene as a safe fallback
+    v   <- apply(Xtr, 2, sd)
+    g0  <- names(v)[which.max(v)]
+    keep_genes <- g0
+  } else {
+    survivors <- ord[which(p_all[ord] < alpha)]
+    if (length(survivors) > cap) survivors <- survivors[seq_len(cap)]
+    if (length(survivors) == 0L) survivors <- ord[1]
+    surv_genes <- colnames(Xtr)[survivors]
+    surv_absb  <- abs(beta_all[survivors])
+    # Stage 2: GMM on |beta|, keep largest-mean cluster
+    if (length(survivors) < min_for_gmm) {
+      keep_genes <- surv_genes
+    } else {
+      cl <- tryCatch({
+        gmm <- mclust::Mclust(surv_absb, G = G, verbose = FALSE)
+        gmm$classification
+      }, error = function(e) {
+        # k-means fallback
+        km <- tryCatch(stats::kmeans(matrix(surv_absb, ncol = 1),
+                                     centers = G, nstart = 5),
+                       error = function(e2) NULL)
+        if (is.null(km)) return(rep(1L, length(surv_absb)))
+        km$cluster
+      })
+      mu_by_cl <- tapply(surv_absb, cl, mean)
+      top_cl   <- as.integer(names(mu_by_cl)[which.max(mu_by_cl)])
+      keep_idx <- which(cl == top_cl)
+      keep_genes <- surv_genes[keep_idx]
+      if (length(keep_genes) == 0L) keep_genes <- surv_genes
+    }
+  }
+  Xtr_keep <- Xtr[, keep_genes, drop = FALSE]
+  mu_g     <- colMeans(Xtr_keep)
+  sd_g     <- apply(Xtr_keep, 2, sd)
+  sd_g[sd_g <= 1e-8] <- 1
+  list(
+    genes     = keep_genes,
+    center    = mu_g,
+    scale     = sd_g,
+    beta_full = beta_all[keep_genes],
+    p_full    = p_all[keep_genes],
+    n_stage1  = sum(p_all < alpha, na.rm = TRUE),
+    n_kept    = length(keep_genes)
+  )
+}
+```
+
+\newpage
+
+## Nested LOO-CV prediction driver
+
+For each held-out patient $i \in \{1, \ldots, 17\}$:
+
+1. **Per-source screening** on the 16 training patients (independent for cfDNA
+   and gDNA in the combined model, per the chosen design).
+2. **Standardize** each kept gene using train mean and SD; standardize age the
+   same way.
+3. Fit `cv.glmnet` (elastic net, $\alpha = 0.5$, inner 5-fold CV,
+   `type.measure = "deviance"`) with `penalty.factor = 0` for age and 1 for
+   every gene.
+4. Predict the held-out patient's MRD-positive probability at `s = "lambda.min"`.
+
+```{r loo-driver}
+loo_predict <- function(X_list, y01, age,
+                        alpha_enet = 0.5, alpha_screen = 0.05, cap_screen = 200) {
+  n <- length(y01)
+  stopifnot(all(sapply(X_list, nrow) == n), length(age) == n)
+  p_hat       <- numeric(n)
+  n_kept_log  <- matrix(NA_real_, nrow = n, ncol = length(X_list),
+                        dimnames = list(NULL, names(X_list)))
+  fold_bal    <- matrix(NA_integer_, n, 2,
+                        dimnames = list(NULL, c("MRDneg", "MRDpos")))
+  screens_log <- vector("list", n)
+
+  for (i in seq_len(n)) {
+    tr <- setdiff(seq_len(n), i)
+    y_tr <- y01[tr]
+
+    fold_bal[i, ] <- c(sum(y_tr == 0), sum(y_tr == 1))
+
+    # Per-source screening on training rows only
+    screens <- lapply(X_list, function(X) {
+      screen_genes(X[tr, , drop = FALSE], y_tr,
+                   alpha = alpha_screen, cap = cap_screen, G = 3)
+    })
+    screens_log[[i]] <- lapply(screens, function(s) s$genes)
+    n_kept_log[i, ] <- sapply(screens, function(s) length(s$genes))
+
+    # Build training and held-out feature matrices
+    age_mu <- mean(age[tr]); age_sd <- sd(age[tr])
+    age_sd <- if (age_sd > 0) age_sd else 1
+    age_tr <- (age[tr] - age_mu) / age_sd
+    age_te <- (age[i]  - age_mu) / age_sd
+
+    gene_block_tr <- do.call(cbind, lapply(seq_along(X_list), function(k) {
+      s <- screens[[k]]
+      X_block <- X_list[[k]][tr, s$genes, drop = FALSE]
+      sweep(sweep(X_block, 2, s$center, "-"), 2, s$scale, "/")
+    }))
+    gene_block_te <- do.call(cbind, lapply(seq_along(X_list), function(k) {
+      s <- screens[[k]]
+      X_block <- X_list[[k]][i, s$genes, drop = FALSE]
+      sweep(sweep(X_block, 2, s$center, "-"), 2, s$scale, "/")
+    }))
+
+    Xtr_full <- cbind(Age = age_tr, gene_block_tr)
+    Xte_full <- cbind(Age = age_te, gene_block_te)
+    if (nrow(Xte_full) != 1L) Xte_full <- matrix(Xte_full, nrow = 1L,
+                                                  dimnames = list(NULL,
+                                                                  colnames(Xtr_full)))
+
+    pf <- c(0, rep(1, ncol(Xtr_full) - 1L))
+    cvf <- tryCatch({
+      cv.glmnet(Xtr_full, y_tr, family = "binomial",
+                alpha = alpha_enet, penalty.factor = pf,
+                nfolds = 5, type.measure = "deviance")
+    }, error = function(e) {
+      message("cv.glmnet failed at fold ", i, ": ", conditionMessage(e))
+      NULL
+    })
+    if (is.null(cvf)) {
+      p_hat[i] <- mean(y_tr)
+    } else {
+      p_hat[i] <- as.numeric(
+        predict(cvf, newx = Xte_full, s = "lambda.min", type = "response")
+      )
+    }
+  }
+  list(p_hat = p_hat,
+       n_kept = n_kept_log,
+       fold_bal = fold_bal,
+       screens = screens_log)
+}
+```
+
+```{r run-loo, cache = FALSE}
+y01 <- cohort$y01
+age <- cohort$age
+
+# (i) cfDNA only
+res_cf  <- loo_predict(list(cf = X_cf), y01, age)
+# (ii) gDNA only
+res_g   <- loo_predict(list(g  = X_g),  y01, age)
+# (iii) cfDNA + gDNA combined
+res_cmb <- loo_predict(list(cf = X_cf, g = X_g), y01, age)
+
+results <- list(
+  `cfDNA only`         = res_cf,
+  `gDNA only`          = res_g,
+  `cfDNA + gDNA`       = res_cmb
+)
+```
+
+\newpage
+
+## Per-fold sanity checks
+
+```{r fold-balance-table}
+fb <- as.data.frame(res_cf$fold_bal) %>%
+  mutate(Fold = seq_len(nrow(.)),
+         `Total train` = MRDneg + MRDpos,
+         `Held out` = ifelse(y01 == 0, "MRDneg", "MRDpos"))
+knitr::kable(
+  fb %>% select(Fold, MRDneg, MRDpos, `Total train`, `Held out`),
+  format = "latex", booktabs = TRUE, escape = FALSE,
+  caption = "Training-set class counts per LOO fold (same across all three models by construction)."
+) %>% kable_styling(latex_options = c("HOLD_position"))
+```
+
+```{r fig5-fold-balance}
+balance_df <- as.data.frame(res_cf$fold_bal) %>%
+  mutate(Fold = seq_len(n())) %>%
+  pivot_longer(cols = c(MRDneg, MRDpos),
+               names_to = "Class", values_to = "Count")
+p_balance <- ggplot(balance_df, aes(Fold, Count, fill = Class)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c(MRDneg = "#457B9D", MRDpos = "#E63946")) +
+  scale_x_continuous(breaks = 1:17) +
+  labs(x = "LOO fold", y = "Patients in training set",
+       title = "Per-fold training-class balance",
+       subtitle = "Each fold leaves out one patient; the remaining 16 form the training set") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+save_both(p_balance, "fig_mrd_pred_fold_balance", width = 8, height = 4)
+include_graphics(file.path(fig_out, "fig_mrd_pred_fold_balance.pdf"))
+```
+
+```{r fig4-gene-counts}
+gene_count_df <- bind_rows(
+  data.frame(Source = "cfDNA", n = res_cf$n_kept[, "cf"], Fold = 1:17),
+  data.frame(Source = "gDNA",  n = res_g$n_kept[, "g"],   Fold = 1:17),
+  data.frame(Source = "Combined: cfDNA",
+             n = res_cmb$n_kept[, "cf"], Fold = 1:17),
+  data.frame(Source = "Combined: gDNA",
+             n = res_cmb$n_kept[, "g"],  Fold = 1:17)
+)
+gene_count_df$Source <- factor(gene_count_df$Source,
+                               levels = c("cfDNA", "gDNA",
+                                          "Combined: cfDNA",
+                                          "Combined: gDNA"))
+p_gene_counts <- ggplot(gene_count_df, aes(Source, n, fill = Source)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.15, height = 0, size = 1.5, alpha = 0.7) +
+  scale_fill_manual(values = c("cfDNA" = "#E63946",
+                               "gDNA"  = "#457B9D",
+                               "Combined: cfDNA" = "#F4A6AB",
+                               "Combined: gDNA"  = "#A8DADC"),
+                    guide = "none") +
+  labs(y = "Number of genes retained after screen",
+       x = NULL,
+       title = "Stage-2 (GMM top cluster) gene counts per LOO fold") +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1),
+        panel.grid.minor = element_blank())
+save_both(p_gene_counts, "fig_mrd_pred_gene_counts", width = 7, height = 4.5)
+include_graphics(file.path(fig_out, "fig_mrd_pred_gene_counts.pdf"))
+```
+
+\newpage
+
+## Inference and metrics
+
+For each of the three models we compute:
+
+- **AUROC** + DeLong 95% CI (`pROC::roc`, `pROC::ci.auc`).
+- **Brier score** on the leave-one-out predicted probabilities.
+- **Calibration intercept** via `glm(y ~ offset(logit(p_hat)))` and
+  **calibration slope** via `glm(y ~ logit(p_hat))`, both with `family = binomial`.
+- **Youden-optimal sensitivity, specificity, accuracy**
+  (`pROC::coords(..., "best", best.method = "youden")`).
+- **Pairwise DeLong tests** comparing AUROCs across the three models
+  (`pROC::roc.test(..., method = "delong", paired = TRUE)`).
+
+```{r metrics}
+logit <- function(p) {
+  p <- pmin(pmax(p, 1e-6), 1 - 1e-6)
+  log(p / (1 - p))
+}
+
+compute_metrics <- function(p_hat, y01, model_name) {
+  roc_obj <- pROC::roc(y01, p_hat, direction = "<", quiet = TRUE)
+  auc_val <- as.numeric(pROC::auc(roc_obj))
+  ci_val  <- as.numeric(pROC::ci.auc(roc_obj, method = "delong"))
+  brier   <- mean((p_hat - y01)^2)
+  # Calibration intercept (CI): fix slope at 1, fit intercept
+  fit_int <- tryCatch(
+    glm(y01 ~ offset(logit(p_hat)), family = binomial()),
+    error = function(e) NULL)
+  ci_int  <- if (!is.null(fit_int)) {
+    coef(summary(fit_int))[1, 1:2]
+  } else c(NA, NA)
+  # Calibration slope (CS): fit slope and intercept jointly
+  fit_slp <- tryCatch(
+    glm(y01 ~ logit(p_hat), family = binomial()),
+    error = function(e) NULL)
+  cs <- if (!is.null(fit_slp)) {
+    coef(summary(fit_slp))[2, 1:2]
+  } else c(NA, NA)
+  # Youden-best cutoff
+  cs_y <- tryCatch(
+    pROC::coords(roc_obj, "best", best.method = "youden",
+                 ret = c("sensitivity", "specificity", "accuracy", "threshold"),
+                 transpose = FALSE),
+    error = function(e) NULL)
+  if (is.null(cs_y) || nrow(cs_y) == 0) {
+    sens <- spec <- acc <- thr <- NA_real_
+  } else {
+    sens <- cs_y$sensitivity[1]
+    spec <- cs_y$specificity[1]
+    acc  <- cs_y$accuracy[1]
+    thr  <- cs_y$threshold[1]
+  }
+  list(
+    model      = model_name,
+    roc        = roc_obj,
+    auc        = auc_val,
+    auc_ci_lo  = ci_val[1],
+    auc_ci_hi  = ci_val[3],
+    brier      = brier,
+    calib_int  = ci_int[1],  calib_int_se = ci_int[2],
+    calib_slp  = cs[1],      calib_slp_se = cs[2],
+    sens       = sens, spec = spec, acc = acc, thr = thr
+  )
+}
+
+metrics_list <- lapply(seq_along(results), function(k) {
+  compute_metrics(results[[k]]$p_hat, y01, names(results)[k])
+})
+names(metrics_list) <- names(results)
+```
+
+```{r table2-headline}
+fmt_ci <- function(est, lo, hi, digits = 3) {
+  sprintf("%.3f (%.3f-%.3f)", est, lo, hi)
+}
+fmt_se <- function(est, se, digits = 3) {
+  if (is.na(est)) return("--")
+  sprintf("%.3f (%.3f)", est, se)
+}
+
+tab2 <- data.frame(
+  Model        = names(metrics_list),
+  `n genes (med, IQR)` = sapply(seq_along(results), function(k) {
+    nks <- rowSums(results[[k]]$n_kept)
+    sprintf("%.0f (%.0f-%.0f)",
+            median(nks), quantile(nks, 0.25), quantile(nks, 0.75))
+  }),
+  `AUROC (95% CI)` = sapply(metrics_list, function(m)
+    fmt_ci(m$auc, m$auc_ci_lo, m$auc_ci_hi)),
+  Brier            = sapply(metrics_list, function(m) sprintf("%.3f", m$brier)),
+  `Calib intercept (SE)` = sapply(metrics_list, function(m)
+    fmt_se(m$calib_int, m$calib_int_se)),
+  `Calib slope (SE)`     = sapply(metrics_list, function(m)
+    fmt_se(m$calib_slp, m$calib_slp_se)),
+  `Sens @ Youden` = sapply(metrics_list, function(m)
+    sprintf("%.3f", m$sens)),
+  `Spec @ Youden` = sapply(metrics_list, function(m)
+    sprintf("%.3f", m$spec)),
+  Accuracy = sapply(metrics_list, function(m) sprintf("%.3f", m$acc)),
+  check.names = FALSE,
+  stringsAsFactors = FALSE,
+  row.names = NULL
+)
+
+knitr::kable(
+  tab2, format = "latex", booktabs = TRUE, escape = TRUE,
+  caption = "Headline LOO-CV performance metrics, by model. AUROC 95\\% CIs are DeLong intervals; calibration intercept is fit with slope fixed at 1; calibration slope is fit jointly with intercept. Sensitivity, specificity, and accuracy are evaluated at the Youden-optimal threshold."
+) %>% kable_styling(latex_options = c("HOLD_position", "scale_down"))
+```
+
+```{r table3-delong}
+roc_list <- lapply(metrics_list, function(m) m$roc)
+pairs <- combn(length(roc_list), 2)
+delong_p <- matrix(NA_real_, length(roc_list), length(roc_list),
+                   dimnames = list(names(roc_list), names(roc_list)))
+diag(delong_p) <- 1
+for (k in seq_len(ncol(pairs))) {
+  i <- pairs[1, k]; j <- pairs[2, k]
+  test <- tryCatch(
+    pROC::roc.test(roc_list[[i]], roc_list[[j]],
+                   method = "delong", paired = TRUE),
+    error = function(e) NULL
+  )
+  if (!is.null(test)) {
+    delong_p[i, j] <- test$p.value
+    delong_p[j, i] <- test$p.value
+  }
+}
+delong_df <- as.data.frame(
+  apply(delong_p, c(1, 2), function(x) {
+    if (is.na(x)) "--" else if (x == 1) "--" else sprintf("%.3f", x)
+  })
+)
+delong_df <- tibble::rownames_to_column(delong_df, "Model")
+knitr::kable(
+  delong_df, format = "latex", booktabs = TRUE, escape = TRUE,
+  caption = "Pairwise DeLong test p-values for AUROC differences (paired across LOO predictions). Diagonal omitted."
+) %>% kable_styling(latex_options = c("HOLD_position"))
+```
+
+\newpage
+
+## Figures: ROC, AUROC forest, calibration
+
+```{r fig1-roc}
+roc_df <- bind_rows(lapply(seq_along(metrics_list), function(k) {
+  r <- metrics_list[[k]]$roc
+  data.frame(
+    Model       = names(metrics_list)[k],
+    Sensitivity = rev(r$sensitivities),
+    Specificity = rev(r$specificities)
+  )
+}))
+roc_df$FPR <- 1 - roc_df$Specificity
+roc_df$Model <- factor(roc_df$Model, levels = names(metrics_list))
+
+label_df <- data.frame(
+  Model = names(metrics_list),
+  label = sapply(metrics_list, function(m)
+    sprintf("AUC = %.2f (%.2f-%.2f)", m$auc, m$auc_ci_lo, m$auc_ci_hi))
+)
+
+model_palette <- c("cfDNA only"   = "#E63946",
+                   "gDNA only"    = "#457B9D",
+                   "cfDNA + gDNA" = "#2C7A4B")
+
+p_roc <- ggplot(roc_df, aes(FPR, Sensitivity, color = Model)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey60") +
+  geom_path(linewidth = 0.9) +
+  scale_color_manual(values = model_palette) +
+  coord_equal() +
+  labs(x = "False positive rate", y = "True positive rate",
+       title = "Leave-one-out ROC curves",
+       subtitle = "AUROCs with DeLong 95% CIs shown in legend") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = c(0.65, 0.18),
+        legend.background = element_rect(fill = "white", color = "grey60"),
+        panel.grid.minor = element_blank()) +
+  guides(color = guide_legend(
+    title = NULL,
+    override.aes = list(linewidth = 1.2),
+    label.theme = element_text(size = 9)
+  ))
+# Add custom legend labels with AUC text
+p_roc <- p_roc + scale_color_manual(
+  values = model_palette,
+  labels = setNames(label_df$label, label_df$Model)
+)
+save_both(p_roc, "fig_mrd_pred_roc", width = 6, height = 6)
+include_graphics(file.path(fig_out, "fig_mrd_pred_roc.pdf"))
+```
+
+```{r fig2-forest}
+forest_df <- data.frame(
+  Model = factor(names(metrics_list), levels = rev(names(metrics_list))),
+  AUC   = sapply(metrics_list, function(m) m$auc),
+  lo    = sapply(metrics_list, function(m) m$auc_ci_lo),
+  hi    = sapply(metrics_list, function(m) m$auc_ci_hi)
+)
+p_forest <- ggplot(forest_df, aes(AUC, Model, color = Model)) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey60") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.18, linewidth = 0.7) +
+  geom_point(size = 3.5) +
+  scale_color_manual(values = model_palette, guide = "none") +
+  xlim(0, 1) +
+  labs(x = "AUROC (95% DeLong CI)", y = NULL,
+       title = "AUROC forest plot",
+       subtitle = "Vertical dashed line: AUROC = 0.5 (chance)") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+save_both(p_forest, "fig_mrd_pred_auc_forest", width = 7, height = 3.5)
+include_graphics(file.path(fig_out, "fig_mrd_pred_auc_forest.pdf"))
+```
+
+```{r fig3-calibration}
+calib_df <- bind_rows(lapply(seq_along(results), function(k) {
+  data.frame(
+    Model = names(results)[k],
+    p_hat = results[[k]]$p_hat,
+    y     = y01
+  )
+}))
+calib_df$Model <- factor(calib_df$Model, levels = names(metrics_list))
+
+p_calib <- ggplot(calib_df, aes(p_hat, y, color = Model)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey60") +
+  geom_smooth(method = "loess", se = TRUE, span = 1.2,
+              method.args = list(family = "gaussian"), linewidth = 0.7) +
+  geom_point(size = 1.8, alpha = 0.7) +
+  scale_color_manual(values = model_palette) +
+  facet_wrap(~ Model, nrow = 1) +
+  labs(x = "Predicted probability (LOO)",
+       y = "Observed MRD-positive status",
+       title = "Calibration of LOO predicted probabilities",
+       subtitle = "Loess fit with 95% confidence band; dashed line = perfect calibration") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "none",
+        strip.background = element_rect(fill = "grey92"),
+        panel.grid.minor = element_blank())
+save_both(p_calib, "fig_mrd_pred_calibration", width = 10, height = 4)
+include_graphics(file.path(fig_out, "fig_mrd_pred_calibration.pdf"))
+```
+
+\newpage
+
+## Supplementary: gene retention frequencies across LOO folds
+
+The two-stage screen is re-run on each LOO training set; a gene that is retained
+in many folds is more likely to be biologically informative than one retained
+in a single fold by chance. We show below the genes retained in $\geq 50\%$ of
+the 17 LOO folds, separately for cfDNA and gDNA (cfDNA-only and gDNA-only model
+folds, respectively, to avoid the combined model's inflation).
+
+```{r table-s1-cfdna-genes}
+tally_genes <- function(screens_log, source_key = NULL) {
+  all_genes <- unlist(lapply(screens_log, function(s) {
+    if (is.null(source_key)) unlist(s) else s[[source_key]]
+  }))
+  freq <- table(all_genes)
+  data.frame(
+    gene = names(freq),
+    n_folds = as.integer(freq),
+    pct_folds = 100 * as.numeric(freq) / length(screens_log),
+    stringsAsFactors = FALSE
+  ) %>% arrange(desc(n_folds))
+}
+
+cf_tally <- tally_genes(res_cf$screens, "cf")
+g_tally  <- tally_genes(res_g$screens,  "g")
+
+cf_top <- cf_tally %>% filter(n_folds >= 9) %>% mutate(pct_folds = sprintf("%.0f%%", pct_folds))
+g_top  <- g_tally  %>% filter(n_folds >= 9) %>% mutate(pct_folds = sprintf("%.0f%%", pct_folds))
+
+if (nrow(cf_top) == 0) {
+  cat("\\textit{No cfDNA genes retained in at least 9 of 17 LOO folds.}\n")
+} else {
+  knitr::kable(
+    cf_top, format = "latex", booktabs = TRUE, escape = TRUE,
+    col.names = c("Gene", "Folds retained (n)", "Folds retained (%)"),
+    caption = "Table S1. cfDNA-only model: genes retained in $\\geq 9$ of 17 LOO folds."
+  ) %>% kable_styling(latex_options = c("HOLD_position"))
+}
+```
+
+```{r table-s2-gdna-genes}
+if (nrow(g_top) == 0) {
+  cat("\\textit{No gDNA genes retained in at least 9 of 17 LOO folds.}\n")
+} else {
+  knitr::kable(
+    g_top, format = "latex", booktabs = TRUE, escape = TRUE,
+    col.names = c("Gene", "Folds retained (n)", "Folds retained (%)"),
+    caption = "Table S2. gDNA-only model: genes retained in $\\geq 9$ of 17 LOO folds."
+  ) %>% kable_styling(latex_options = c("HOLD_position"))
+}
+```
+
+\newpage
+
+## Headline summary
+
+```{r headline-text, results = "asis"}
+cat("Per-model leave-one-out performance and pairwise DeLong tests:\n\n")
+for (k in seq_along(metrics_list)) {
+  m <- metrics_list[[k]]
+  cat(sprintf("- **%s**: AUROC = %.3f (95%% DeLong CI %.3f to %.3f); Brier = %.3f; Sens@Youden = %.3f; Spec@Youden = %.3f.\n",
+              names(metrics_list)[k], m$auc, m$auc_ci_lo, m$auc_ci_hi,
+              m$brier, m$sens, m$spec))
+}
+cat("\nPairwise DeLong p-values:\n\n")
+for (k in seq_len(ncol(pairs))) {
+  i <- pairs[1, k]; j <- pairs[2, k]
+  cat(sprintf("- **%s vs %s**: p = %s.\n",
+              names(metrics_list)[i], names(metrics_list)[j],
+              if (is.na(delong_p[i, j])) "NA" else sprintf("%.3f", delong_p[i, j])))
+}
+```
+
+## Caveats and interpretation
+
+- **Sample size**: $n = 17$ with a 7-vs-10 MRD class split is severely
+  underpowered. Expected DeLong 95% CI width on a single AUROC is ~0.30; the
+  CI on an AUROC *difference* between two models is even wider. Non-significant
+  pairwise DeLong tests are consistent with both genuine equivalence and an
+  underpowered comparison; both readings are admissible.
+
+- **Stage 1 multiple testing**: with ~11,000 genes per source and a Stage-1
+  threshold of uncorrected $p < 0.05$, we expect ~550 false positives per fold.
+  The Stage-2 GMM step prunes most of these but is *not* formal error control.
+  The genes-retained-in-many-folds tables (S1, S2) are the closest thing to a
+  stable signal in this analysis.
+
+
+- **Calibration is fragile at this $n$**: a calibration slope CI can easily span
+  zero with 17 patients. Calibration intercept/slope are reported for
+  completeness but should not drive decisions.
+
+
+# Note on the removed per-component L1 analysis
+
+Sections that regressed the per-component $L_1$ concordance $C_{it}^{(k)}$ on
+the MRD trajectory (stacked functional regression and per-cycle ANOVA) have
+been removed. The $L_1$ concordance metric is no longer reported in this
+paper; the single subclonal-concordance measure is the posterior correlation
+of $\omega^{cf}$ and $\omega^{g}$ (see `R/04_concordance_metrics.R`,
+`krd_posterior_correlation.csv`), and its association with MRD is reported in
+`R/11_concordance_mrd_association.R`.
+
+
+# Session info
+
+```{r sessioninfo, echo = TRUE}
+sessionInfo()
+```

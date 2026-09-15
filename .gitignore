@@ -1,0 +1,63 @@
+##############################################################################
+# PATIENT DATA — NEVER COMMIT
+#
+# The KRd trial 5-hmC counts and sample keys are protected human-subjects data
+# and are not redistributable. Anything derived from them (fitted objects,
+# rendered reports, figures, tables) is equally out of bounds.
+##############################################################################
+
+# Raw inputs
+KRd trial/
+*_genebody_count.RDS
+*_sample_key.csv
+
+# Everything derived from patient data
+results/
+figures/
+tables/
+logs/
+
+# Rendered reports (these embed patient-derived results).
+# Scoped to the directories where output lands, rather than a blanket *.pdf,
+# so a deliberately curated figure can still be added with `git add -f`.
+*.pdf
+*.html
+*.docx
+!docs/**/*.pdf
+
+##############################################################################
+# Build artifacts
+##############################################################################
+
+# Rcpp / compiled objects
+*.o
+*.so
+*.dll
+R/cpp/*.o
+R/cpp/*.so
+
+# R session state
+.Rhistory
+.Rapp.history
+.RData
+.Rproj.user/
+*.Rproj
+
+# LaTeX intermediates from knitted reports
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+
+##############################################################################
+# OS / editor
+##############################################################################
+.DS_Store
+Thumbs.db
+*~
+*.swp
+.vscode/
+.idea/
