@@ -2,7 +2,7 @@
 ## R/02_preprocess.R
 ## Preprocess KRd trial 5-hMC data for the HDP concordance model
 ##
-## Gene selection: ~310 candidate genes identified by pooled limma-voom DE
+## Gene selection: ~318 candidate genes identified by pooled limma-voom DE
 ## analysis (design: ~ timepoint + source, blocking on patient_id via
 ## duplicateCorrelation) across all paired observations jointly.
 ## Threshold: adj.P.Val < 0.05 & |logFC| > 0.5 (gDNA vs cfDNA effect).
@@ -133,13 +133,33 @@ colnames(raw_cf_all) <- paste0("CF_", paired$barcode_cf)
 colnames(raw_g_all)  <- paste0("G_",  paired$barcode_g)
 pooled_all <- cbind(raw_cf_all, raw_g_all)
 
-# Gene-level QC: keep genes with >= 10 counts in >= 95% of samples
+# Gene-level QC defining the universe for the DE test: keep genes with >= 10
+# counts in >= 95% of the pooled cfDNA + gDNA samples.
+#
+# KRd DATA ONLY. This is deliberate and is a change from the historical
+# pipeline, which is worth recording because it changes the gene count.
+#
+# The original selection (parent folder R/01_match_and_normalize.R ->
+# R/04_DE_genes_and_concordance.R) tested an 11,430-gene universe and selected
+# 310 genes. That 11,430 was NOT reachable from KRd data alone: it was the
+# intersection of the KRd QC set with a separate breast-cancer case-control
+# cohort, after per-source VST had dropped all-zero genes in each. Depending on
+# an unrelated cohort to fix this analysis's feature set is both scientifically
+# unmotivated and fatal to this folder being self-contained, so that dependency
+# has been removed.
+#
+# Consequence: the universe is 11,816 genes and the DE set is 318, not 310.
+# The two sets overlap in 308 genes (10 gained, 2 lost) -- 318 is NOT a
+# superset of 310, because the universe size feeds the BH correction and hence
+# the adjusted p-values. Any manuscript text or downstream artifact quoting
+# p = 310 must be updated to p = 318.
 n_all_samples <- ncol(pooled_all)
 keep_genes    <- rownames(pooled_all)[rowSums(pooled_all >= 10) >= 0.95 * n_all_samples]
 pooled_filt   <- pooled_all[keep_genes, , drop = FALSE]
-cat("Genes passing QC filter:", length(keep_genes), "\n")
+cat("Genes passing QC filter (KRd only, >=10 counts in >=95% of samples):",
+    length(keep_genes), "\n")
 
-# Joint DESeq2 VST on QC-filtered pooled matrix (needed for voom weights)
+# Joint DESeq2 VST on the QC-filtered pooled matrix (needed for voom weights)
 mat_qc <- round(pooled_filt)
 storage.mode(mat_qc) <- "integer"
 mat_qc <- mat_qc[rowSums(mat_qc) > 0, , drop = FALSE]

@@ -556,14 +556,14 @@ draw_flowchart <- function() {
   draw_arrow(cx, 0.616, cx, 0.570)
 
   draw_box(cx, 0.558, 0.46, 0.028,
-           "Pooled limma-voom -> 310 candidate genes\n(FDR < 0.05, |log2FC| > 0.5; ~ timepoint + source)",
+           "Pooled limma-voom -> 318 candidate genes\n(FDR < 0.05, |log2FC| > 0.5; ~ timepoint + source)",
            fill = "#F9EBEA", border = "#c0392b", lwd = 1.5, cex = 0.62, font = 2)
 
   draw_arrow(cx, 0.544, cx, 0.524)
 
   # ---- Exploratory ----
   draw_box(cx, 0.507, 0.44, 0.030,
-           "Exploratory analysis: PCA + gene-level correlations\n(restricted to 310 candidate genes)",
+           "Exploratory analysis: PCA + gene-level correlations\n(restricted to 318 candidate genes)",
            cex = 0.62)
   draw_arrow(cx, 0.492, cx, 0.472)
 
@@ -571,7 +571,7 @@ draw_flowchart <- function() {
   draw_group(cx, 0.392, 0.56, 0.145, "Bayesian DP mixture model")
 
   draw_box(cx, 0.447, 0.48, 0.033,
-           "Fit M1 (tracking) and M0 (non-tracking) models\non 310 candidate genes",
+           "Fit M1 (tracking) and M0 (non-tracking) models\non 318 candidate genes",
            cex = 0.67, font = 2)
   draw_arrow(cx, 0.430, cx, 0.411)
 

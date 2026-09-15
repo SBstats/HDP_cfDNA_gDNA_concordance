@@ -244,7 +244,7 @@ fit_dp_concordance <- function(Y_g, Y_cf, patient, time,
   # component order. Off by default.
   #
   # MEMORY NOTE: the subject-level trace is [n_tr x p x K x n]. At this
-  # analysis's dimensions (p=310, K=10, n=26, 50 draws) that is ~0.03 GB per
+  # analysis's dimensions (p=318, K=10, n=26, 50 draws) that is ~0.03 GB per
   # chain -- fine. At genome-wide scale (p~11,837) the same structure is
   # ~123 GB per chain. Do NOT port this setting to a full-gene pipeline
   # without restricting to occupied components or a gene subset.
