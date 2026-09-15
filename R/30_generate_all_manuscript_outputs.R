@@ -117,6 +117,12 @@ cat(sprintf("K+ mode: %d  Dominant k=%d (pi=%.4f)  2nd k=%d (pi=%.4f)\n",
             K_plus_mode, k_dom, final_pi[k_dom], k_2nd, final_pi[k_2nd]))
 
 smry <- function(x) {
+  ## NA-safe. A fit can legitimately carry an all-NaN parameter -- the
+  ## kappa = 0.50 sensitivity fit has sigma_0 NaN in all 1000 draws -- and
+  ## quantile() then aborts the whole script. Return NA for that parameter and
+  ## let the caller report a gap, rather than losing every downstream figure.
+  x <- x[is.finite(x)]
+  if (!length(x)) return(c(mean=NA_real_, median=NA_real_, lo=NA_real_, hi=NA_real_))
   q <- quantile(x, c(0.025, 0.975))
   c(mean=mean(x), median=median(x), lo=unname(q[1]), hi=unname(q[2]))
 }
@@ -586,6 +592,75 @@ ggsave(file.path(fig_b, "krd_omega_trajectory_grid.pdf"),  p_fig4_traj, width=w_
 ggsave(file.path(fig_n, "fig4_omega_trajectory_grid.pdf"), p_fig4_traj, width=w_traj, height=h_traj, limitsize=FALSE)
 cat(sprintf("  Saved fig4_omega_trajectory_grid.pdf (%d patients x %d subclones, %.1fx%.1f in)\n",
             n_distinct(traj_df$Study.ID), length(k_occ_sorted), w_traj, h_traj))
+
+
+###############################################################################
+## FIGURE 4b — Non-tumour (normal tissue) omega_0 trajectory grid
+##
+## Deliberately built to MIRROR Figure 4a: same patient row order, same
+## timepoint axis, same theme, one panel per patient. The only structural
+## difference is a single column, because omega_0 is NOT subclone-specific --
+## it is one Bernoulli split per (subject, timepoint) sitting outside the
+## Dirichlet over subclones.
+##
+## Row order is taken from `patient_order` computed for Figure 4a, so the two
+## grids can be read side by side row-for-row. Do not re-sort here.
+###############################################################################
+cat("\n[Fig 4b] Non-tumour omega_0 trajectory grid...\n")
+
+bg_df <- data.frame(
+  Study.ID  = pi_info$Study.ID,
+  Timepoint = pi_info$Timepoint,
+  omega0_pm = omega0_pm_obs,
+  omega0_lo = apply(m1c$omega_0, 2, quantile, 0.025),
+  omega0_hi = apply(m1c$omega_0, 2, quantile, 0.975),
+  stringsAsFactors = FALSE
+)
+
+## Same duplicate-aggregation rule as Figure 4a (101-17 and 101-73 each have
+## two entries at 3 YR F/U).
+bg_df <- bg_df %>%
+  group_by(Study.ID, Timepoint) %>%
+  summarise(omega0_pm = mean(omega0_pm, na.rm = TRUE),
+            omega0_lo = mean(omega0_lo, na.rm = TRUE),
+            omega0_hi = mean(omega0_hi, na.rm = TRUE), .groups = "drop")
+
+bg_df$Timepoint <- factor(bg_df$Timepoint, levels = tp_levels_traj)
+## CRITICAL: reuse Figure 4a's patient_order so rows align across the two grids.
+bg_df$Study.ID  <- factor(bg_df$Study.ID, levels = patient_order)
+bg_df$panel_lbl <- "Non-tumour (normal tissue)"
+
+p_fig4b <- ggplot(bg_df, aes(x = Timepoint, y = omega0_pm, group = 1)) +
+  geom_ribbon(aes(ymin = omega0_lo, ymax = omega0_hi),
+              fill = "#9E9E9E", alpha = 0.30, na.rm = TRUE) +
+  geom_line(linewidth = 0.7, colour = "#424242", na.rm = TRUE) +
+  geom_point(size = 1.2, colour = "#424242", na.rm = TRUE) +
+  scale_x_discrete(labels = tp_short, drop = FALSE) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.01)) +
+  facet_grid(Study.ID ~ panel_lbl, scales = "free_y", switch = "y") +
+  labs(x = NULL,
+       y = expression(paste("Posterior mean ", omega[paste(0, italic(it))])),
+       title = "Fig 4b: Longitudinal non-tumour (normal tissue) fraction") +
+  theme_bw(base_size = 6.5) +
+  theme(strip.text.y.left = element_text(size = 5, angle = 0, hjust = 1),
+        strip.text.x      = element_text(size = 6.5, face = "bold"),
+        strip.placement   = "outside",
+        axis.text.x       = element_text(angle = 45, hjust = 1, size = 5),
+        axis.text.y       = element_text(size = 4.5),
+        axis.title.y      = element_text(size = 6),
+        panel.spacing     = unit(0.12, "lines"),
+        plot.title        = element_text(size = 8, face = "bold"))
+
+## Height matches Figure 4a exactly (same rows); width is one column.
+w_4b <- 2.8 * 1 + 1.2
+ggsave(file.path(fig_b, "krd_omega0_trajectory_grid.pdf"), p_fig4b,
+       width = w_4b, height = h_traj, limitsize = FALSE)
+ggsave(file.path(fig_n, "fig4b_omega0_trajectory_grid.pdf"), p_fig4b,
+       width = w_4b, height = h_traj, limitsize = FALSE)
+cat(sprintf("  Saved fig4b_omega0_trajectory_grid.pdf (%d patients x 1 column, %.1fx%.1f in)\n",
+            n_distinct(bg_df$Study.ID), w_4b, h_traj))
+cat(sprintf("  Row order identical to Fig 4a: %s\n",
+            identical(levels(bg_df$Study.ID), as.character(patient_order))))
 
 
 ###############################################################################

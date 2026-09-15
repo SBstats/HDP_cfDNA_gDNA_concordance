@@ -132,6 +132,17 @@ fit_dp_concordance <- function(Y_g, Y_cf, patient, time,
                                 fixed_temp = NULL,
                                 store_theta_trace = FALSE,
                                 theta_trace_thin = 5,
+                                ## Re-anchor components that hold zero allocations, during
+                                ## burn-in only. Prevents the prior-only random walk described
+                                ## at the re-anchor block below. Default ON: the drift is a
+                                ## defect rather than a modelling choice. Set FALSE to
+                                ## reproduce pre-fix behaviour exactly.
+                                empty_reanchor = TRUE,
+                                ## Annealing shape. "geometric" is linear in log T (i.e. beta
+                                ## grows exponentially) and spends far more of the burn-in in
+                                ## the critical T ~ 1-2 window where the mixture commits to a
+                                ## K+. "linear" is the historical schedule.
+                                anneal_schedule = c("linear", "geometric"),
                                 init = NULL) {
 
   set.seed(seed)
@@ -203,6 +214,10 @@ fit_dp_concordance <- function(Y_g, Y_cf, patient, time,
     phi      = numeric(n_save),   # D2 cross-source coupling (tracking estimand)
     alpha_dp = numeric(n_save),
     K_plus   = integer(n_save),
+    ## Occupancy count (any component with >= 1 allocated gene). Diagnostic
+    ## only -- K_plus above is the reported quantity and uses a weight
+    ## threshold, identically for M1 and M0.
+    K_plus_occupied = integer(n_save),
     # Contamination fraction, now PER OBSERVATION (omega_0[i,t]); columns follow
     # the observation ordering of Y_g/Y_cf. Use model_data$paired_info to map a
     # column back to (patient, timepoint).
@@ -359,6 +374,10 @@ fit_dp_concordance <- function(Y_g, Y_cf, patient, time,
   # Back-compat: anchor_frac=NULL reproduces the legacy fused anchor kappa*pi.
   # -------------------------------------------------------------------
   lambda_method <- match.arg(lambda_method)
+  anneal_schedule <- match.arg(anneal_schedule)
+  ## Per-gene data centre, used by the empty-component re-anchor below.
+  ## Loop-invariant, so computed once.
+  y_ctr_reanchor <- rowMeans(cbind(Y_g, Y_cf), na.rm = TRUE)   # [p]
   lambda_track  <- if (!is.null(lambda_init)) lambda_init else kappa_fixed
   use_p_anchor  <- !is.null(anchor_frac)
   # anchor multiplier applied to pi to form eta (either c*p, or legacy kappa)
@@ -409,7 +428,16 @@ fit_dp_concordance <- function(Y_g, Y_cf, patient, time,
       # Annealed: cool to T=1 with buffer before burn-in ends.
       n_cool <- max(1, n_burn - n_cool_buffer)
       temp <- if (anneal && iter <= n_cool) {
-        T_anneal * (1 - (iter - 1) / n_cool) + 1
+        ## The LINEAR-in-T schedule races through the critical region: at
+        ## T_anneal = 20 with n_cool = 10,000 it spends only ~2.5% of burn-in
+        ## at T <= 2, which is where the mixture commits to a number of
+        ## occupied components. The geometric schedule is linear in log T and
+        ## spends ~23% of burn-in there at identical cost.
+        if (identical(anneal_schedule, "geometric")) {
+          T_anneal^(1 - (iter - 1) / n_cool)
+        } else {
+          T_anneal * (1 - (iter - 1) / n_cool) + 1
+        }
       } else {
         1.0
       }
@@ -517,6 +545,56 @@ fit_dp_concordance <- function(Y_g, Y_cf, patient, time,
                                     hp$b_vs + 0.5 * sum(dev_k^2))
       varsigma_k2[k] <- max(varsigma_k2[k], 1e-8)
     }
+
+    # ---- EMPTY-COMPONENT RE-ANCHOR (burn-in only) ----------------------
+    #
+    # PROBLEM. A component k holding zero allocations has n_ijk = 0 for every
+    # (i, j). Step 2a therefore draws theta[, k, ] from its prior
+    # N(theta_bar[, k], varsigma_k^2), and Step 2b draws theta_bar[, k] back
+    # from those same thetas under the horseshoe. That two-block Gibbs cycle
+    # touches NO likelihood term: it is a random walk on a hierarchical normal
+    # with no data, restrained only by a half-Cauchy tail. The horseshoe adds
+    # positive feedback, since a larger theta_bar inflates lambda^2, which
+    # lowers the prior precision, which permits a still larger theta_bar.
+    #
+    # On the production fit this drove |theta_bar| to 153 while the data lie in
+    # [0.01, 11.49]. Two consequences, the second being the damaging one:
+    #   (a) spurious between-chain variance in theta_bar, varsigma_k and tau_k;
+    #   (b) the component becomes a USELESS BIRTH CANDIDATE. Occupying it costs
+    #       roughly 3.2 nats per gene and needs ~1000 genes to move at once, so
+    #       single-site Gibbs cannot do it. Chains then cannot agree on the
+    #       number of occupied components, which is exactly what was observed
+    #       (K+ modes 3, 2, 2, 2 with loglik split-Rhat 1.79).
+    #
+    # FIX. While a component is empty, re-anchor it on the per-gene data centre
+    # rather than letting the prior-only cycle carry it away. It stays a
+    # plausible birth candidate, so K+ can move.
+    #
+    # VALIDITY. Gated on iter <= n_burn, so it cannot touch any saved draw:
+    # sampling of the reported posterior begins at iter > n_burn (see the
+    # save block below). This is the same logical status as the existing
+    # `anneal` block -- both alter the burn-in trajectory only, and neither
+    # changes the post-burn-in transition kernel. The move fires only for
+    # components with zero allocations, whose coordinates enter the joint
+    # density through the prior alone.
+    if (isTRUE(empty_reanchor) && iter <= n_burn) {
+      N_k_all <- rowSums(n_g_counts) + rowSums(n_cf_counts)
+      k_empty <- which(N_k_all == 0)
+      if (length(k_empty)) {
+        vs_prior_mean <- hp$b_vs / max(hp$a_vs - 1, 1e-8)
+        for (k in k_empty) {
+          sd_k <- sqrt(varsigma_k2[k])
+          theta_bar[, k]  <- y_ctr_reanchor + rnorm(p, 0, sd_k)
+          theta[, k, ]    <- rnorm(p * n, rep(theta_bar[, k], n), sd_k)
+          varsigma_k2[k]  <- vs_prior_mean
+          tau_k2[k]       <- 0.1
+          lambda2[, k]    <- 1
+          nu_aux[, k]     <- 1
+          xi_aux[k]       <- 1
+        }
+      }
+    }
+    # --------------------------------------------------------------------
 
     # --- Background hierarchy: theta_0_bar[j] and varsigma_0^2 ---
     # theta_0_bar[j] | . ~ N( s2*(sum_i theta_0[j,i]/vs0 + m_0/s_0_2), s2 )
@@ -670,6 +748,17 @@ fit_dp_concordance <- function(Y_g, Y_cf, patient, time,
       N_k  <- (sum(n_g_counts[k, ]) + sum(n_cf_counts[k, ])) * inv_temp
       sigma_k2[k] <- 1 / rgamma(1, hp$a_sigma + N_k/2,
                                   b_sigma + ss_k/2)
+      ## FLOOR sigma_k^2, as varsigma_k^2 already is (see the varsigma update).
+      ## Without it a component whose allocated genes happen to be near-identical
+      ## can draw sigma_k^2 ~ 0; dnorm(y, theta, 0, log = TRUE) is then -Inf for
+      ## EVERY component, log_sum_exp2 propagates -Inf, and a single such draw
+      ## poisons loglik, WAIC, PSIS-LOO and every downstream Rhat.
+      ##
+      ## NOTE the mechanism: this is NOT floating-point underflow of the density.
+      ## dnorm(..., log = TRUE) is exact even at |y - theta| = 1e4 (it returns
+      ## -5e7, not -Inf). The -Inf requires a degenerate sigma_k, so flooring the
+      ## variance is the correct and sufficient guard.
+      sigma_k2[k] <- max(sigma_k2[k], 1e-8)
     }
 
     # Update shared rate b_sigma for the variance priors (hierarchical pooling).
@@ -788,11 +877,24 @@ fit_dp_concordance <- function(Y_g, Y_cf, patient, time,
         ## sorted, so the downstream permutation is the identity.
         samples$v[idx, ] <- inv_stick_break(pi_vec[ord_theta])[1:(K-1)]
       } else {
-        # Under M0, K+ is the union of components occupied in either source.
-        # We also record source-specific stick-breaking for downstream inspection.
+        # K+ MUST use the same definition as M1 (weight above 0.01), otherwise
+        # the two models are not comparable on this quantity. The previous
+        # definition here counted any component with >= 1 allocated gene, which
+        # is a much weaker criterion: on the production fit it reported K+ = 5
+        # for M0 against 2-3 for M1, an apparent model difference that was
+        # entirely an artifact of the two definitions. Under the common
+        # weight-based rule M0 gives a consistent K+ = 3.
+        #
+        # The occupancy count is retained separately as K_plus_occupied, since
+        # it is a useful diagnostic (it detects components holding a handful of
+        # genes), but it is NOT the reported K+.
         m_g_total  <- rowSums(n_g_counts)
         m_cf_total <- rowSums(n_cf_counts)
-        samples$K_plus[idx] <- sum((m_g_total > 0) | (m_cf_total > 0))
+        pi_g_s  <- stick_break(c(v_g[1:(K-1)],  1))
+        pi_cf_s <- stick_break(c(v_cf[1:(K-1)], 1))
+        samples$K_plus[idx] <- sum(pmax(pi_g_s, pi_cf_s) > 0.01)
+        if (!is.null(samples$K_plus_occupied))
+          samples$K_plus_occupied[idx] <- sum((m_g_total > 0) | (m_cf_total > 0))
         samples$v_g[idx, ]  <- v_g[1:(K-1)]
         samples$v_cf[idx, ] <- v_cf[1:(K-1)]
       }
@@ -1476,8 +1578,8 @@ merge_chain_samples <- function(chains) {
   ## tracking estimand. Omitting them made merged$phi silently NULL, and
   ## compute_sim_metrics() falls back through lambda to the FIXED kappa, which
   ## would report a constant tracking correlation with no warning.
-  for (nm in c("kappa", "alpha_dp", "K_plus", "sigma_0", "varsigma_0",
-               "b_sigma", "loglik", "phi", "lambda")) {
+  for (nm in c("kappa", "alpha_dp", "K_plus", "K_plus_occupied", "sigma_0",
+               "varsigma_0", "b_sigma", "loglik", "phi", "lambda")) {
     if (!is.null(ref[[nm]])) {
       merged[[nm]] <- do.call(c, lapply(chains, function(ch) ch$samples[[nm]]))
     }
@@ -1610,8 +1712,35 @@ theta_separation_check <- function(fit, k_occ = NULL, n_req = NULL) {
   K  <- ncol(tb)
 
   if (is.null(k_occ)) {
-    om <- fit$final_omega_g
-    k_occ <- if (!is.null(om)) which(rowMeans(om) >= 0.01) else seq_len(min(K, 3))
+    ## Occupancy MUST be judged in the same component order as theta_bar_postmean,
+    ## i.e. the CANONICAL (decreasing-weight) order the sampler accumulates in.
+    ##
+    ## `final_omega_g` is the LAST RAW ITERATION in unrelabelled order, so using
+    ## it selects the wrong components: on the production M1 fit it returned
+    ## k = 4, 5, 10 while the occupied components in canonical order are 1, 2, 3.
+    ## The check was then comparing theta_bar columns for horseshoe-shrunk empty
+    ## components -- whose gaps are noise -- and reporting A1 as violated.
+    ##
+    ## Use the posterior-mean cohort weight from the omega trace, which is stored
+    ## canonically (see the omega_g_trace block in the sampler).
+    ogt <- fit$samples$omega_g_trace
+    if (!is.null(ogt) && !is.null(fit$N_obs) && fit$N_obs > 0) {
+      N_obs_f <- fit$N_obs
+      K_tr    <- ncol(ogt) %/% N_obs_f
+      wbar    <- vapply(seq_len(K_tr), function(k)
+                   mean(ogt[, ((k - 1L) * N_obs_f + 1L):(k * N_obs_f)], na.rm = TRUE),
+                   numeric(1))
+      k_occ <- which(is.finite(wbar) & wbar >= 0.01)
+    } else if (!is.null(fit$final_omega_g)) {
+      ## Fallback for fits without a stored trace. Flag it: the ordering may not
+      ## match theta_bar, so the result should be treated as unverified.
+      warning("theta_separation_check: no omega_g_trace; falling back to ",
+              "final_omega_g, whose component order may not match theta_bar. ",
+              "Interpret the A1 verdict with caution.", call. = FALSE)
+      k_occ <- which(rowMeans(fit$final_omega_g) >= 0.01)
+    } else {
+      k_occ <- seq_len(min(K, 3))
+    }
   }
   k_occ <- k_occ[k_occ <= K & k_occ <= length(vs)]
   ## Cardinality requirement. Assumption A1 asks for |J_kk'(delta)| >= 3*m, where
